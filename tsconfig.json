@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "outDir": "dist",
+    "lib": [
+      "ES2023"
+    ],
+    "types": [
+      "node"
+    ],
+    "skipLibCheck": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "jsx": "preserve",
+    "strict": true,
+    "strictFunctionTypes": false,
+    "noEmit": true,
+    "noErrorTruncation": true,
+    "esModuleInterop": true
+  },
+  "include": [
+    "src",
+    "test",
+    "scripts"
+  ]
+}
