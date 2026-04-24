@@ -787,6 +787,11 @@ async function getPackageJsonGitSha(
     {cwd: pkg.path, reject: false},
   )
   const commitLines = recentCommits.split('\n').filter(Boolean)
+  if (packageJson?.version) {
+    const versionCommitMessage = `version ${packageJson.version}`
+    const match = commitLines.find(line => line.slice(line.indexOf(' ') + 1) === versionCommitMessage)
+    if (match) return match.split(' ', 1)[0]
+  }
   const oldestShownSha = commitLines.at(-1)?.split(' ', 1)[0]
   const repoUrl = getPackageJsonRepository(
     loadRHSPackageJson(pkg) || loadLHSPackageJson(pkg) || loadPackageJson(path.join(getWorkspaceRoot(), 'package.json')),
