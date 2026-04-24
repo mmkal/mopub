@@ -22,7 +22,12 @@ export const PublishInput = z
         'actually publish packages - if not provided the tool will run in dry-run mode and create a directory containing the packages to be published.',
       )
       .optional(),
-    otp: z.string().describe('npm otp - needed with --publish. If not provided you will be prompted for it').optional(),
+    otp: z
+      .string()
+      .describe(
+        'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
+      )
+      .optional(),
     bump: z
       .enum(['major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease', 'other', 'independent'])
       .describe('semver "bump" strategy - if not provided you will be prompted for it. Do not use with --version.')
@@ -69,7 +74,7 @@ export const setupContextTasks: ListrTask<Ctx>[] = [
         projectName = path.basename(getWorkspaceRoot())
       }
       if (!projectName) throw new Error(`Couldn't get package name from pnpm list output: ${list.stdout}`)
-      ctx.tempDir = path.join('/tmp/npmono', projectName, Date.now().toString())
+      ctx.tempDir = path.join('/tmp/mopub', projectName, Date.now().toString())
       task.output = ctx.tempDir
       fs.mkdirSync(ctx.tempDir, {recursive: true})
     },
@@ -514,18 +519,7 @@ export const publish = async (input: PublishInput) => {
         rendererOptions: {persistentOutput: true},
         task: async (ctx, task) => {
           const shouldActuallyPublish = input.publish
-          let otp = input.otp
-          if (shouldActuallyPublish) {
-            otp ||= await task.prompt(ListrEnquirerPromptAdapter).run<string>({
-              message: 'Enter npm OTP (press enter to try publishing without MFA)',
-              type: 'Input',
-              validate: v => v === '' || (typeof v === 'string' && /^\d{6}$/.test(v)),
-            })
-            if (otp.length === 0) {
-              task.output = 'No OTP provided - publish will likely error unless you have disabled MFA.'
-            }
-          }
-          const publishTasks = createPublishTasks(ctx, {otp})
+          const publishTasks = createPublishTasks(ctx, {otp: input.otp})
           if (!shouldActuallyPublish) publishTasks.forEach(t => (t.skip = true))
 
           return task.newListr(publishTasks, {rendererOptions: {collapseSubtasks: false}})
@@ -538,7 +532,7 @@ export const publish = async (input: PublishInput) => {
         task: async (ctx, task) => {
           task.output = `To publish, run the following command:`
           task.output += `\n\n`
-          task.output += `pnpm npmono prebuilt ${ctx.tempDir}`
+          task.output += `npx mopub prebuilt ${ctx.tempDir}`
         },
       },
     ],
@@ -563,7 +557,12 @@ function loadContext(folderPath: string) {
 export const PrebuiltInput = z.tuple([
   z.string().describe('Path to the prebuilt publishable folder'),
   z.object({
-    otp: z.string().describe('OTP for publishing. If not provided, you will be prompted for it.').optional(),
+    otp: z
+      .string()
+      .describe(
+        'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
+      )
+      .optional(),
   }),
 ])
 type PrebuiltInput = z.infer<typeof PrebuiltInput>
@@ -573,32 +572,7 @@ export async function publishPrebuilt([folder, options]: PrebuiltInput) {
   if (me.exitCode) throw new Error(`Failed to get npm username: ${me.stderr}`)
   console.log(me.stdout, '<<<<<<< npm whoami')
   const ctx = loadContext(folder)
-  const tasks = new Listr(
-    [
-      {
-        title: 'Get OTP',
-        enabled: !options.otp,
-        task: async (_ctx, task) => {
-          options.otp = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
-            message: 'Enter npm OTP',
-            type: 'Input',
-            validate: v => v === '' || (typeof v === 'string' && /^\d{6}$/.test(v)),
-          })
-          if (options.otp === '') {
-            const confirmed = await task.prompt(ListrEnquirerPromptAdapter).run<boolean>({
-              message: 'This will fail unless you have disabled MFA, which is not recommended.',
-              type: 'confirm',
-            })
-            if (!confirmed) {
-              throw new Error('OTP not provided')
-            }
-          }
-        },
-      },
-      ...createPublishTasks(ctx, options),
-    ],
-    {ctx},
-  )
+  const tasks = new Listr(createPublishTasks(ctx, options), {ctx})
 
   await tasks.run()
 }
@@ -633,9 +607,13 @@ function createPublishTasks(ctx: Ctx, options: {otp?: string}) {
       title: 'Publish complete',
       rendererOptions: {persistentOutput: true},
       task: async (_ctx, task) => {
+        const firstPkg = ctx.packages[0]
+        const left = loadLHSPackageJson(firstPkg)?.version || firstPkg?.shas?.left
+        const right = firstPkg?.targetVersion || firstPkg?.shas?.right
+        const comparison = left && right ? ` --comparison ${left}...${right}` : ''
         task.output = `To open a release draft, run the following command:`
         task.output += `\n\n`
-        task.output += `pnpm npmono release-notes`
+        task.output += `npx mopub release-notes${comparison}`
       },
     } as ListrTask,
   ]
