@@ -299,9 +299,11 @@ export const publish = async (input: PublishInput) => {
           const {stdout: rightSha} = await execa('git', ['log', '-n', '1', '--pretty=format:%h', '--', '.'])
           for (const pkg of ctx.packages) {
             pkg.shas = {
-              left: await getPackageLastPublishRef(pkg),
+              left: await getPackageLastPublishRef(pkg, task),
               right: rightSha,
             }
+          }
+          for (const pkg of ctx.packages) {
             const changelog = await getChangelog(ctx, pkg)
             if (ctx.versionStrategy.type === 'fixed') {
               pkg.targetVersion = ctx.versionStrategy.version
@@ -415,7 +417,10 @@ export const publish = async (input: PublishInput) => {
                   packageJson.name = `${input.scope}/${name}`
                 }
 
-                packageJson.dependencies = await getBumpedDependencies(ctx, {pkg}).then(r => r.dependencies)
+                const bumped = await getBumpedDependencies(ctx, {pkg})
+                packageJson.dependencies = bumped.dependencies
+                packageJson.peerDependencies = bumped.peerDependencies
+                packageJson.optionalDependencies = bumped.optionalDependencies
 
                 fs.writeFileSync(
                   packageJsonFilepath(pkg, RHS_FOLDER),
@@ -756,22 +761,49 @@ function getWorkspaceRoot() {
   )
 }
 
-/** "Pessimistic" comparison ref. Tries to use the registry package.json's `git.sha` property, and uses the first ever commit to the package folder if that can't be found. */
-async function getPackageLastPublishRef(pkg: Pkg) {
+/** "Pessimistic" comparison ref. Tries to use the registry package.json's `git.sha` property, falls back to a matching version tag, and if neither exists prompts the user (with the first commit to the package folder as the default). */
+async function getPackageLastPublishRef(pkg: Pkg, task: ListrTaskWrapper<Ctx, never, never>) {
   const packageJson = loadLHSPackageJson(pkg)
-  return first7(await getPackageJsonGitSha(pkg, packageJson))
+  return first7(await getPackageJsonGitSha(pkg, packageJson, task))
 }
 
 const first7 = (s: string) => s.slice(0, 7)
 
-async function getPackageJsonGitSha(pkg: Pkg, packageJson: PackageJson | null) {
+async function getPackageJsonGitSha(
+  pkg: Pkg,
+  packageJson: PackageJson | null,
+  task: ListrTaskWrapper<Ctx, never, never>,
+) {
   const explicitSha = packageJson?.git?.sha
   if (explicitSha) return explicitSha
 
   const tagSha = await getPackageJsonShaFromVersionTag(pkg, packageJson)
   if (tagSha) return tagSha
 
-  return await getFirstRef(pkg)
+  const firstRef = await getFirstRef(pkg)
+  const {stdout: recentCommits} = await execa(
+    'git',
+    ['log', '-n', '20', '--pretty=format:%h %s', '--', '.'],
+    {cwd: pkg.path, reject: false},
+  )
+  const commitLines = recentCommits.split('\n').filter(Boolean)
+  const oldestShownSha = commitLines.at(-1)?.split(' ', 1)[0]
+  const repoUrl = getPackageJsonRepository(
+    loadRHSPackageJson(pkg) || loadLHSPackageJson(pkg) || loadPackageJson(path.join(getWorkspaceRoot(), 'package.json')),
+  )
+  const olderUrl =
+    repoUrl && oldestShownSha ? `\nOlder commits: ${repoUrl}/commits/${oldestShownSha}` : ''
+  const recentList = commitLines.length ? `\nRecent commits in ${pkg.path}:\n${commitLines.join('\n')}${olderUrl}\n` : ''
+  const promptAnswer = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
+    type: 'Input',
+    message: `Couldn't find a git sha for the last published version of ${pkg.name}.${recentList}\nEnter the sha to diff from (leave empty to use ${firstRef.slice(0, 7)}, the first commit in ${pkg.path}):`,
+    validate: (v: unknown) => {
+      if (typeof v !== 'string') return 'Enter a sha, or leave empty to use the first commit.'
+      if (!v.trim()) return true
+      return /^[0-9a-f]{4,40}$/i.test(v.trim()) ? true : 'Enter a valid git sha (4-40 hex chars) or leave empty.'
+    },
+  })
+  return promptAnswer.trim() || firstRef
 }
 
 async function getPackageJsonShaFromVersionTag(pkg: Pkg, packageJson: PackageJson | null) {
@@ -799,14 +831,22 @@ async function getFirstRef(pkg: Pkg) {
   return commitsOldestFirst.split('\n')[0]
 }
 
+const DEP_SECTIONS = ['dependencies', 'peerDependencies', 'optionalDependencies'] as const
+type DepSection = (typeof DEP_SECTIONS)[number]
+
 /**
- * For a particular package, get the `dependencies` object with any necessary version bumps.
- * Requires a `pkg`, and an `expectVersion` function
+ * For a particular package, get the `dependencies` / `peerDependencies` / `optionalDependencies`
+ * objects with any necessary version bumps. Each workspace dep is written back to whichever
+ * section it was originally in, so peer/optional deps aren't silently promoted to regular deps.
  */
 async function getBumpedDependencies(ctx: Ctx, params: {pkg: Pkg}) {
   const leftPackageJson = loadLHSPackageJson(params.pkg)
   const rightPackageJson = loadRHSPackageJson(params.pkg)
-  const rightPackageDependencies = {...rightPackageJson?.dependencies}
+  const bumped: Record<DepSection, Record<string, string> | undefined> = {
+    dependencies: rightPackageJson?.dependencies && {...rightPackageJson.dependencies},
+    peerDependencies: rightPackageJson?.peerDependencies && {...rightPackageJson.peerDependencies},
+    optionalDependencies: rightPackageJson?.optionalDependencies && {...rightPackageJson.optionalDependencies},
+  }
   const updates: Record<string, string> = {}
 
   for (const depName of Object.keys(params.pkg.dependencies || {})) {
@@ -823,23 +863,38 @@ async function getBumpedDependencies(ctx: Ctx, params: {pkg: Pkg}) {
         `Package ${params.pkg.name} depends on ${depName} but ${depName} is not published, and no target version was set for publishing now. Did you opt to skip publishing ${depName}? If so, please re-run and make sure to publish ${depName}. You can't publish ${params.pkg.name} until you do that.`,
       )
     }
-    let prefix = ['^', '~', ''].find(p => rightPackageJson?.dependencies?.[depName]?.startsWith(p)) || ''
+
+    const section: DepSection =
+      DEP_SECTIONS.find(s => rightPackageJson?.[s]?.[depName]) ||
+      DEP_SECTIONS.find(s => leftPackageJson?.[s]?.[depName]) ||
+      'dependencies'
+    const currentVersionInSection = rightPackageJson?.[section]?.[depName]
+    let prefix = ['^', '~', ''].find(p => currentVersionInSection?.startsWith(p)) || ''
     if (semver.prerelease(expected)) {
       prefix = ''
     }
+    const newVersion = prefix + expected
 
-    rightPackageDependencies[depName] = prefix + expected
-    const leftPackageDependencyVersion = leftPackageJson?.dependencies?.[depName]
-    updates[depName] =
-      `${leftPackageDependencyVersion || JSON.stringify({params, name: depName, depName: depName}, null, 2)} -> ${rightPackageDependencies[depName]}`
+    bumped[section] = {...bumped[section], [depName]: newVersion}
+
+    const leftVersion =
+      leftPackageJson?.dependencies?.[depName] ||
+      leftPackageJson?.peerDependencies?.[depName] ||
+      leftPackageJson?.optionalDependencies?.[depName]
+    updates[depName] = `${leftVersion || '(new)'} -> ${newVersion}`
   }
 
   if (Object.keys(updates).length === 0) {
-    // keep reference equality, avoid `undefined` to `{}`
-    return {updated: updates, dependencies: rightPackageJson?.dependencies}
+    // keep reference equality, avoid `undefined` -> `{}` churn
+    return {
+      updated: updates,
+      dependencies: rightPackageJson?.dependencies,
+      peerDependencies: rightPackageJson?.peerDependencies,
+      optionalDependencies: rightPackageJson?.optionalDependencies,
+    }
   }
 
-  return {updated: updates, dependencies: rightPackageDependencies}
+  return {updated: updates, ...bumped}
 }
 
 /** Get a markdown formatted list of commits for a package. */
@@ -1031,6 +1086,8 @@ const PackageJson = z.object({
   name: z.string(),
   version: z.string(),
   dependencies: z.record(z.string(), z.string()).optional(),
+  peerDependencies: z.record(z.string(), z.string()).optional(),
+  optionalDependencies: z.record(z.string(), z.string()).optional(),
   scripts: z.record(z.string(), z.string()).optional(),
   /**
    * not an official package.json field, but there is a library that does something similar to this: https://github.com/Metnew/git-hash-package
@@ -1197,7 +1254,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
                         throw e
                       })
                     pkg.shas ||= {} as never
-                    pkg.shas[pullable.side] = await getPackageJsonGitSha(pkg, packageJson)
+                    pkg.shas[pullable.side] = await getPackageJsonGitSha(pkg, packageJson, subtask)
                   } else if (/^[\da-f]+/.test(pullable.str)) {
                     // actually it's a sha
                     pkg.shas ||= {} as never
