@@ -1,6 +1,6 @@
 import {ListrEnquirerPromptAdapter} from '@listr2/prompt-adapter-enquirer'
-import {Options, execa} from '@rebundled/execa'
-import findUp from 'find-up'
+import {Options, execa} from 'execa'
+import {findUpSync} from 'find-up'
 import * as fs from 'fs'
 import {Listr, ListrTask, ListrTaskWrapper} from 'listr2'
 import * as path from 'path'
@@ -752,7 +752,7 @@ function getBumpedVersionValidation(lowerBoundVersion: string, v: unknown) {
 
 function getWorkspaceRoot() {
   return path.dirname(
-    findUp.sync('pnpm-workspace.yaml') || findUp.sync('pnpm-lock.yaml') || findUpOrThrow('.git', {type: 'directory'}),
+    findUpSync('pnpm-workspace.yaml') || findUpSync('pnpm-lock.yaml') || findUpOrThrow('.git', {type: 'directory'}),
   )
 }
 
@@ -1110,8 +1110,8 @@ async function pipeExeca(task: ListrTaskWrapper<any, any, any>, file: string, ar
   return cmd
 }
 
-function findUpOrThrow(file: string, options?: Parameters<typeof findUp.sync>[1]) {
-  const result = findUp.sync(file, options)
+function findUpOrThrow(file: string, options?: Parameters<typeof findUpSync>[1]) {
+  const result = findUpSync(file, options)
   if (!result) {
     throw new Error(`Could not find ${file}`)
   }
