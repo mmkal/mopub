@@ -13,7 +13,8 @@
     "dogfood": "tsx src/cli",
     "build": "tsc --noEmit false --outDir dist",
     "prepack": "pnpm run build",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "echo maybe later"
   },
   "license": "ISC",
   "packageManager": "pnpm@10.30.1",
