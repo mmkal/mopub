@@ -28,6 +28,10 @@ export const PublishInput = z
         'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
       )
       .optional(),
+    tag: z
+      .string()
+      .describe('tag to publish to. Leave unset to use the last tag from the registry.')
+      .optional(),
     bump: z
       .enum(['major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease', 'other', 'independent'])
       .describe('semver "bump" strategy - if not provided you will be prompted for it. Do not use with --version.')
@@ -519,7 +523,7 @@ export const publish = async (input: PublishInput) => {
         rendererOptions: {persistentOutput: true},
         task: async (ctx, task) => {
           const shouldActuallyPublish = input.publish
-          const publishTasks = createPublishTasks(ctx, {otp: input.otp})
+          const publishTasks = createPublishTasks(ctx, {otp: input.otp, tag: input.tag})
           if (!shouldActuallyPublish) publishTasks.forEach(t => (t.skip = true))
 
           return task.newListr(publishTasks, {rendererOptions: {collapseSubtasks: false}})
@@ -563,6 +567,10 @@ export const PrebuiltInput = z.tuple([
         'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
       )
       .optional(),
+    tag: z
+      .string()
+      .describe('tag to publish to. Leave unset to use the last tag from the registry.')
+      .optional(),
   }),
 ])
 type PrebuiltInput = z.infer<typeof PrebuiltInput>
@@ -577,7 +585,7 @@ export async function publishPrebuilt([folder, options]: PrebuiltInput) {
   await tasks.run()
 }
 
-function createPublishTasks(ctx: Ctx, options: {otp?: string}) {
+function createPublishTasks(ctx: Ctx, options: {otp?: string; tag?: string}) {
   return [
     ...ctx.packages.map((pkg): ListrTask => {
       const lhsPackageJson = loadLHSPackageJson(pkg)
@@ -590,7 +598,8 @@ function createPublishTasks(ctx: Ctx, options: {otp?: string}) {
           if (options.otp) publishArgs.push('--otp', options.otp)
           if (rhsPackageJson && semver.prerelease(rhsPackageJson.version)) {
             const first = semver.prerelease(rhsPackageJson.version)?.[0]
-            const tag = typeof first === 'string' ? first : 'next'
+            let tag = options.tag
+            tag ||= typeof first === 'string' ? first : 'next'
             publishArgs.push('--tag', tag)
           }
           await pipeExeca(subtask, 'pnpm', ['publish', ...publishArgs], {
