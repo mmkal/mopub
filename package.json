@@ -10,9 +10,9 @@
     "dist"
   ],
   "scripts": {
-    "dogfood": "tsx src/cli",
+    "clean": "rm -rf dist",
     "build": "tsc --noEmit false --outDir dist",
-    "prepack": "pnpm run build",
+    "prepack": "pnpm clean && pnpm build",
     "lint": "eslint .",
     "test": "echo maybe later"
   },
