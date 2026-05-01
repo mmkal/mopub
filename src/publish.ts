@@ -25,7 +25,7 @@ export const PublishInput = z
     otp: z
       .string()
       .describe(
-        'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
+        'npm OTP to pass through to `npm publish --otp`. If not provided you will be prompted for it (press enter at the prompt to try publishing without MFA, e.g. for registries that use browser-based auth).',
       )
       .optional(),
     tag: z
@@ -137,6 +137,20 @@ async function getRegistryVersions(pkg: Pick<Pkg, 'name'>) {
   ])
   const registryVersionsStdout = StdoutShape.parse(JSON.parse(registryVersionsResult.stdout))
   return Array.isArray(registryVersionsStdout) ? registryVersionsStdout : []
+}
+
+async function getRegistryDistTags(pkgName: string): Promise<Record<string, string>> {
+  const result = await execa('npm', ['view', pkgName, 'dist-tags', '--json'], {reject: false})
+  if (!result.stdout) return {}
+  try {
+    const parsed = JSON.parse(result.stdout) as unknown
+    if (parsed && typeof parsed === 'object' && !('error' in parsed)) {
+      return parsed as Record<string, string>
+    }
+  } catch {
+    // ignore - fall through to empty
+  }
+  return {}
 }
 
 const _breakpoint = (why = 'hmm'): ListrTask<Ctx> => ({
@@ -523,7 +537,18 @@ export const publish = async (input: PublishInput) => {
         rendererOptions: {persistentOutput: true},
         task: async (ctx, task) => {
           const shouldActuallyPublish = input.publish
-          const publishTasks = createPublishTasks(ctx, {otp: input.otp, tag: input.tag})
+          let otp = input.otp
+          if (shouldActuallyPublish) {
+            otp ||= await task.prompt(ListrEnquirerPromptAdapter).run<string>({
+              message: 'Enter npm OTP (press enter to try publishing without MFA)',
+              type: 'Input',
+              validate: v => v === '' || (typeof v === 'string' && /^\d{6}$/.test(v)),
+            })
+            if (otp.length === 0) {
+              task.output = 'No OTP provided - publish will likely error unless you have disabled MFA.'
+            }
+          }
+          const publishTasks = createPublishTasks(ctx, {otp, tag: input.tag})
           if (!shouldActuallyPublish) publishTasks.forEach(t => (t.skip = true))
 
           return task.newListr(publishTasks, {rendererOptions: {collapseSubtasks: false}})
@@ -564,7 +589,7 @@ export const PrebuiltInput = z.tuple([
     otp: z
       .string()
       .describe(
-        'npm OTP to pass through to `npm publish --otp`. Only needed for registries that still require OTP-based 2FA. Leave unset to use npm\'s default browser-based auth flow.',
+        'npm OTP to pass through to `npm publish --otp`. If not provided you will be prompted for it (press enter at the prompt to try publishing without MFA, e.g. for registries that use browser-based auth).',
       )
       .optional(),
     tag: z
@@ -580,7 +605,32 @@ export async function publishPrebuilt([folder, options]: PrebuiltInput) {
   if (me.exitCode) throw new Error(`Failed to get npm username: ${me.stderr}`)
   console.log(me.stdout, '<<<<<<< npm whoami')
   const ctx = loadContext(folder)
-  const tasks = new Listr(createPublishTasks(ctx, options), {ctx})
+  const tasks = new Listr(
+    [
+      {
+        title: 'Get OTP',
+        enabled: () => !options.otp,
+        task: async (_ctx, task) => {
+          options.otp = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
+            message: 'Enter npm OTP (press enter to try publishing without MFA)',
+            type: 'Input',
+            validate: v => v === '' || (typeof v === 'string' && /^\d{6}$/.test(v)),
+          })
+          if (options.otp === '') {
+            const confirmed = await task.prompt(ListrEnquirerPromptAdapter).run<boolean>({
+              message: 'This will fail unless you have disabled MFA, which is not recommended.',
+              type: 'confirm',
+            })
+            if (!confirmed) {
+              throw new Error('OTP not provided')
+            }
+          }
+        },
+      },
+      ...createPublishTasks(ctx, options),
+    ],
+    {ctx},
+  )
 
   await tasks.run()
 }
@@ -596,11 +646,32 @@ function createPublishTasks(ctx: Ctx, options: {otp?: string; tag?: string}) {
         task: async (_ctx, subtask) => {
           const publishArgs = ['--access', 'public']
           if (options.otp) publishArgs.push('--otp', options.otp)
-          if (rhsPackageJson && semver.prerelease(rhsPackageJson.version)) {
+
+          let resolvedTag = options.tag
+          // default to whichever dist-tag the previous comparable release was published under,
+          // when both versions are the same prerelease/non-prerelease type. e.g. if 0.0.1-1 was
+          // published as "latest", a follow-up 0.0.1-2 should also go to "latest" (not "next");
+          // if 4.0.0 was published as "next", 4.0.1 should also be "next" (not "latest").
+          if (!resolvedTag && lhsPackageJson?.version && rhsPackageJson?.version) {
+            const sameType =
+              Boolean(semver.prerelease(lhsPackageJson.version)) ===
+              Boolean(semver.prerelease(rhsPackageJson.version))
+            if (sameType) {
+              const distTags = await getRegistryDistTags(pkg.name)
+              const matchingTags = Object.entries(distTags)
+                .filter(([, v]) => v === lhsPackageJson.version)
+                .map(([t]) => t)
+              if (matchingTags.length > 0) {
+                resolvedTag = matchingTags.find(t => t === 'latest') || matchingTags[0]
+              }
+            }
+          }
+
+          if (resolvedTag) {
+            publishArgs.push('--tag', resolvedTag)
+          } else if (rhsPackageJson && semver.prerelease(rhsPackageJson.version)) {
             const first = semver.prerelease(rhsPackageJson.version)?.[0]
-            let tag = options.tag
-            tag ||= typeof first === 'string' ? first : 'next'
-            publishArgs.push('--tag', tag)
+            publishArgs.push('--tag', typeof first === 'string' ? first : 'next')
           }
           await pipeExeca(subtask, 'pnpm', ['publish', ...publishArgs], {
             cwd: path.dirname(packageJsonFilepath(pkg, RHS_FOLDER)),
