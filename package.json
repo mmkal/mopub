@@ -3,6 +3,10 @@
   "version": "0.0.4",
   "description": "Publish packages in a pnpm monorepo",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mmkal/mopub"
+  },
   "bin": {
     "mopub": "dist/cli.js"
   },
