@@ -322,7 +322,7 @@ export const publish = async (input: PublishInput) => {
           const {stdout: rightSha} = await execa('git', ['log', '-n', '1', '--pretty=format:%h', '--', '.'])
           for (const pkg of ctx.packages) {
             pkg.shas = {
-              left: await getPackageLastPublishRef(pkg, task),
+              left: await getPackageLastPublishRef(pkg, task as never),
               right: rightSha,
             }
           }
@@ -733,11 +733,21 @@ async function pullRegistryPackage(
   {version, folder}: {version: string; folder: string},
 ) {
   // note: `npm pack foobar` will actually pull foobar.1-2-3.tgz from the registry. It's not actually doing a "pack" at all. `pnpm pack` does not do the same thing - it packs the local directory
-  await pipeExeca(subtask, 'npm', ['pack', `${pkg.name}@${version}`], {cwd: folder})
+  const packResult = await pipeExeca(subtask, 'npm', ['pack', `${pkg.name}@${version}`], {cwd: folder})
 
-  const tgzFileName = fs.readdirSync(folder).at(0)
-  if (!tgzFileName) {
-    throw new Error(`No tgz file found in ${folder}, tried to pull ${pkg.name}@${version}`)
+  const packStdout = typeof packResult.stdout === 'string' ? packResult.stdout : ''
+  const tgzFileName = packStdout
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line.endsWith('.tgz'))
+  const folderEntries = fs.readdirSync(folder)
+  if (!tgzFileName || !folderEntries.includes(tgzFileName)) {
+    throw new Error(
+      [
+        `Expected npm pack ${pkg.name}@${version} to write ${tgzFileName || 'a .tgz file'} in ${folder}.`,
+        `Found: ${folderEntries.length ? folderEntries.join(', ') : '(nothing)'}`,
+      ].join('\n'),
+    )
   }
 
   await pipeExeca(subtask, 'tar', ['-xvzf', tgzFileName], {cwd: folder})
@@ -819,7 +829,7 @@ function getWorkspaceRoot() {
   )
 }
 
-/** "Pessimistic" comparison ref. Tries to use the registry package.json's `git.sha` property, falls back to a matching version tag, and if neither exists prompts the user (with the first commit to the package folder as the default). */
+/** "Pessimistic" comparison ref. Tries to use the registry package.json's `git.sha` property, falls back to a matching version tag, and if neither exists prompts the user to choose between the last publish with a findable sha, the last commit before the previous publish, the first commit to the package folder, or a manually-entered sha. */
 async function getPackageLastPublishRef(pkg: Pkg, task: ListrTaskWrapper<Ctx, never, never>) {
   const packageJson = loadLHSPackageJson(pkg)
   return first7(await getPackageJsonGitSha(pkg, packageJson, task))
@@ -857,16 +867,81 @@ async function getPackageJsonGitSha(
   const olderUrl =
     repoUrl && oldestShownSha ? `\nOlder commits: ${repoUrl}/commits/${oldestShownSha}` : ''
   const recentList = commitLines.length ? `\nRecent commits in ${pkg.path}:\n${commitLines.join('\n')}${olderUrl}\n` : ''
+
+  const choices: {message: string; value: string}[] = []
+  const lastPublishWithSha = await findLastPublishWithFindableSha(pkg, commitLines)
+  if (lastPublishWithSha) {
+    choices.push({
+      message: `${first7(lastPublishWithSha.sha)} - last publish with a findable sha (${lastPublishWithSha.version})`,
+      value: lastPublishWithSha.sha,
+    })
+  }
+  const commitBeforePreviousPublish = await getLastCommitBeforePreviousPublish(pkg, packageJson)
+  if (commitBeforePreviousPublish) {
+    choices.push({
+      message: `${first7(commitBeforePreviousPublish.sha)} - last commit before previous publish (${commitBeforePreviousPublish.version} @ ${commitBeforePreviousPublish.time})`,
+      value: commitBeforePreviousPublish.sha,
+    })
+  }
+  choices.push(
+    {message: `${first7(firstRef)} - first commit in ${pkg.path}`, value: firstRef},
+    {message: 'Other (enter a sha manually)', value: 'other'},
+  )
+
+  const selected = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
+    type: 'Select',
+    message: `Couldn't find a git sha for the last published version of ${pkg.name}.${recentList}\nSelect the sha to diff from:`,
+    choices,
+  })
+  if (selected !== 'other') return selected
+
   const promptAnswer = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
     type: 'Input',
-    message: `Couldn't find a git sha for the last published version of ${pkg.name}.${recentList}\nEnter the sha to diff from (leave empty to use ${firstRef.slice(0, 7)}, the first commit in ${pkg.path}):`,
+    message: `Enter the sha to diff from:`,
     validate: (v: unknown) => {
-      if (typeof v !== 'string') return 'Enter a sha, or leave empty to use the first commit.'
-      if (!v.trim()) return true
-      return /^[0-9a-f]{4,40}$/i.test(v.trim()) ? true : 'Enter a valid git sha (4-40 hex chars) or leave empty.'
+      if (typeof v !== 'string' || !/^[0-9a-f]{4,40}$/i.test(v.trim())) return 'Enter a valid git sha (4-40 hex chars).'
+      return true
     },
   })
-  return promptAnswer.trim() || firstRef
+  return promptAnswer.trim()
+}
+
+/**
+ * Walks the registry's published versions newest-first looking for one whose git sha can be determined - via the
+ * registry package.json's `git.sha`, a version tag, or a `version x.y.z` commit message - even if its
+ * prerelease-ness doesn't match the version being compared against. Capped at the 20 newest versions to bound
+ * `npm view` calls.
+ */
+async function findLastPublishWithFindableSha(pkg: Pkg, recentCommitLines: string[]) {
+  const newestFirst = pkg.publishedVersions.slice().reverse().slice(0, 20)
+  for (const version of newestFirst) {
+    const {stdout: registrySha} = await execa('npm', ['view', `${pkg.name}@${version}`, 'git.sha'], {reject: false})
+    if (registrySha.trim()) return {version, sha: registrySha.trim()}
+
+    const tagSha = await getShaFromVersionTag(pkg, version)
+    if (tagSha) return {version, sha: tagSha}
+
+    const versionCommitMessage = `version ${version}`
+    const match = recentCommitLines.find(line => line.slice(line.indexOf(' ') + 1) === versionCommitMessage)
+    if (match) return {version, sha: match.split(' ', 1)[0]}
+  }
+  return null
+}
+
+/** The last commit in the package folder made before the previous version was published, based on the registry's publish timestamp. */
+async function getLastCommitBeforePreviousPublish(pkg: Pkg, packageJson: PackageJson | null) {
+  const previousVersion = packageJson?.version || pkg.publishedVersions.at(-1)
+  if (!previousVersion) return null
+  const timesResult = await execa('npm', ['view', pkg.name, 'time', '--json'], {reject: false})
+  const times = z.record(z.string(), z.string()).safeParse(JSON.parse(timesResult.stdout || '{}'))
+  const publishTime = times.success ? times.data[previousVersion] : undefined
+  if (!publishTime) return null
+  const {stdout: sha} = await execa(
+    'git',
+    ['log', '-n', '1', `--before=${publishTime}`, '--pretty=format:%h', '--', '.'],
+    {cwd: pkg.path, reject: false},
+  )
+  return sha ? {version: previousVersion, time: publishTime, sha} : null
 }
 
 async function getPackageJsonShaFromVersionTag(pkg: Pkg, packageJson: PackageJson | null) {
@@ -874,13 +949,17 @@ async function getPackageJsonShaFromVersionTag(pkg: Pkg, packageJson: PackageJso
   //   `Getting ${pkg.name} (${packageJson?.version}) sha from version tag. v[] thing: ${packageJson?.version ? (await execa('git', ['log', '-n', '1', `v${packageJson?.version}`], {cwd: pkg.path})).stdout : JSON.stringify({pkg, packageJson}, null, 2)}`,
   // )
   if (!packageJson?.version) return null
-  const {stdout: vTagSha} = await execa('git', ['rev-list', '-n', '1', `v${packageJson.version}`], {
+  return getShaFromVersionTag(pkg, packageJson.version)
+}
+
+async function getShaFromVersionTag(pkg: Pick<Pkg, 'path'>, version: string) {
+  const {stdout: vTagSha} = await execa('git', ['rev-list', '-n', '1', `v${version}`], {
     cwd: pkg.path,
     reject: false,
   })
   if (vTagSha) return vTagSha
 
-  const {stdout: tagSha} = await execa('git', ['rev-list', '-n', '1', packageJson.version], {
+  const {stdout: tagSha} = await execa('git', ['rev-list', '-n', '1', version], {
     cwd: pkg.path,
     reject: false,
   })
