@@ -27,25 +27,18 @@ Other commands:
 - `npx mopub local` replaces workspace deps with `file:` paths and prints `pnpm add` commands so you can test installs in another project.
 - `npx mopub --help` for the full option list.
 
-## Staged package transforms
+## Transform staged packages
 
-Add `mopub.config.mjs` in the workspace root when the publishable package needs final edits that should not live in source. mopub applies these edits to the staged `right/package` folder after it has packed the package and written version/git/dependency metadata, but before changelogs, diffs, context, and publishing.
-
-For example, a fork can keep its source package named `jsonata` while publishing the staged artifact as `@mmkal/jsonata`:
+Add `mopub.config.mjs` in the workspace root when the staged package needs final edits before publish:
 
 ```js
 import {defineConfig} from 'mopub'
 
 export default defineConfig({
-  packages: {
-    jsonata: {
-      publishName: '@mmkal/jsonata',
-    },
-  },
-  async transformPackage({pkg, packageJson, helpers}) {
-    if (pkg.name !== 'jsonata') return
-
-    packageJson.description = 'JSON query and transformation language. Includes a synchronous API.'
+  async transformPackage({directory, helpers}) {
+    await helpers.editJsonFile('package.json', packageJson => {
+      packageJson.name = '@mmkal/jsonata'
+    })
 
     await helpers.editFile('README.md', readme => {
       return `This is a fork of jsonata.\n\n${readme.replaceAll(/\bjsonata\b/g, '@mmkal/jsonata')}`
@@ -54,15 +47,7 @@ export default defineConfig({
 })
 ```
 
-`packages[sourceName].publishName` is the package name mopub uses for registry lookup, npm links, dist-tags, dependency rewrites, and the final staged `package.json` name. `transformPackage` runs once per selected package and receives:
-
-- `packageDir`: the staged package directory.
-- `packageJsonPath`: the staged package.json path.
-- `packageJson`: a mutable package.json object, written back after the transform.
-- `pkg`: `{name, publishName, version, targetVersion, path}`.
-- `helpers`: async path-confined helpers for text and JSON files.
-
-Use either the mutable `packageJson` object or `helpers.editJsonFile('package.json', ...)` for package.json changes, not both. Name changes belong in `publishName`, and version changes belong in mopub's version inputs.
+The transform runs after mopub writes version/git/dependency metadata into `right/package`, and before changelogs, diffs, context, and publishing. For simple scope changes, `--scope @your-scope` is still the better option.
 
 ## Caveats
 

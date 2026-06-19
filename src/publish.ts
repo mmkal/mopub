@@ -6,9 +6,7 @@ import {Listr, ListrTask, ListrTaskWrapper} from 'listr2'
 import * as path from 'path'
 import * as semver from 'semver'
 import {z} from 'zod'
-import type {MopubConfig} from './config.js'
 import {loadMopubConfig} from './config.js'
-import {applyPublishNames, writePublishedDependencyVersion} from './package-identity.js'
 import {runTransformPackage} from './transform-package.js'
 
 const VERSION_ZERO = '0.0.0'
@@ -53,118 +51,88 @@ export const PublishInput = z
   })
   .refine(obj => !(obj.bump && obj.version), {message: `Don't use --bump and --version together`})
 export type PublishInput = z.infer<typeof PublishInput>
-type PublishOptions = PublishInput & {config?: MopubConfig}
 
-function createSetupContext(options: {scope?: string; config?: MopubConfig} = {}) {
-  let config: MopubConfig = options.config || {}
-  const tasks: ListrTask<Ctx>[] = [
-    {
-      title: 'Set working directory',
-      task: async () => process.chdir(getWorkspaceRoot()),
+export const setupContextTasks: ListrTask<Ctx>[] = [
+  {
+    title: 'Set working directory',
+    task: async () => process.chdir(getWorkspaceRoot()),
+  },
+  ...Object.keys(loadPackageJson(path.join(getWorkspaceRoot(), 'package.json'))?.scripts || {})
+    .filter(s => s.match(/^(build)$/))
+    .map(
+      (s): ListrTask => ({
+        title: `Running ${s} script`,
+        task: async (_ctx, task) => {
+          const isPnpmMonorepo = fs.existsSync('pnpm-workspace.yaml')
+          const buildArgs = [s]
+          if (isPnpmMonorepo) buildArgs.unshift('--workspace-root')
+          await pipeExeca(task, 'pnpm', buildArgs)
+        },
+      }),
+    ),
+  {
+    title: 'Get temp directory',
+    rendererOptions: {persistentOutput: true},
+    task: async (ctx, task) => {
+      const list = await execa('pnpm', ['list', '--json', '--depth', '0', '--filter', '.'])
+      let projectName = JSON.parse(list.stdout)?.[0]?.name as string | undefined
+      if (!projectName) {
+        projectName = path.basename(getWorkspaceRoot())
+      }
+      if (!projectName) throw new Error(`Couldn't get package name from pnpm list output: ${list.stdout}`)
+      ctx.tempDir = path.join('/tmp/mopub', projectName, Date.now().toString())
+      task.output = ctx.tempDir
+      fs.mkdirSync(ctx.tempDir, {recursive: true})
     },
-    {
-      title: 'Load mopub config',
-      rendererOptions: {persistentOutput: true},
-      task: async (_ctx, task) => {
-        if (options.config) {
-          task.output = 'Using config passed to publish()'
-          return
-        }
-        const loaded = await loadMopubConfig(getWorkspaceRoot())
-        config = loaded.config
-        task.output = loaded.filepath || 'No config found'
-      },
-    },
-    {
-      title: 'Running build script',
-      enabled: () => Boolean(loadPackageJson(path.join(getWorkspaceRoot(), 'package.json'))?.scripts?.build),
-      task: async (_ctx, task) => {
-        const isPnpmMonorepo = fs.existsSync('pnpm-workspace.yaml')
-        const buildArgs = ['build']
-        if (isPnpmMonorepo) buildArgs.unshift('--workspace-root')
-        await pipeExeca(task, 'pnpm', buildArgs)
-      },
-    },
-    {
-      title: 'Get temp directory',
-      rendererOptions: {persistentOutput: true},
-      task: async (ctx, task) => {
-        const list = await execa('pnpm', ['list', '--json', '--depth', '0', '--filter', '.'])
-        let projectName = JSON.parse(list.stdout)?.[0]?.name as string | undefined
-        if (!projectName) {
-          projectName = path.basename(getWorkspaceRoot())
-        }
-        if (!projectName) throw new Error(`Couldn't get package name from pnpm list output: ${list.stdout}`)
-        ctx.tempDir = path.join('/tmp/mopub', projectName, Date.now().toString())
-        task.output = ctx.tempDir
-        fs.mkdirSync(ctx.tempDir, {recursive: true})
-      },
-    },
-    {
-      title: 'Collecting packages',
-      rendererOptions: {persistentOutput: true},
-      task: async (ctx, task) => {
-        const listResult = await execa('pnpm', ['list', '--json', '--recursive', '--only-projects', '--prod'])
-        const firstResult = listResult.stdout.split('\n\n')[0] // pnpm can find unrelated packages that live in the repo, but they're returned in a separate json object after two newlines
-        // e.g. for pnpm first it lists just the `np` package.json, but then it finds various test packages like `test/fixtures/foo/package.json` etc.
+  },
+  {
+    title: 'Collecting packages',
+    rendererOptions: {persistentOutput: true},
+    task: async (ctx, task) => {
+      const listResult = await execa('pnpm', ['list', '--json', '--recursive', '--only-projects', '--prod'])
+      const firstResult = listResult.stdout.split('\n\n')[0] // pnpm can find unrelated packages that live in the repo, but they're returned in a separate json object after two newlines
+      // e.g. for pnpm first it lists just the `np` package.json, but then it finds various test packages like `test/fixtures/foo/package.json` etc.
 
-        try {
-          ctx.packages = JSON.parse(firstResult) as never
-        } catch {
-          throw new Error(`Failed to parse pnpm list output as JSON: ${firstResult}`)
-        }
-        ctx.packages = ctx.packages.filter(pkg => !pkg.private)
+      try {
+        ctx.packages = JSON.parse(firstResult) as never
+      } catch {
+        throw new Error(`Failed to parse pnpm list output as JSON: ${firstResult}`)
+      }
+      ctx.packages = ctx.packages.filter(pkg => !pkg.private)
 
-        const pwdsCommand = await execa('pnpm', ['recursive', 'exec', 'pwd']) // use `pnpm recursive exec` to get the correct topological sort order // https://github.com/pnpm/pnpm/issues/7716
-        const pwdIndexMap = Object.fromEntries(pwdsCommand.stdout.split('\n').map((s, i) => [s.trim(), i]))
+      const pwdsCommand = await execa('pnpm', ['recursive', 'exec', 'pwd']) // use `pnpm recursive exec` to get the correct topological sort order // https://github.com/pnpm/pnpm/issues/7716
+      const pwdIndexMap = Object.fromEntries(pwdsCommand.stdout.split('\n').map((s, i) => [s.trim(), i]))
 
-        // sort topologically, alphabetically as a tiebreaker. note that this implementation relies on there being fewer than one million packages in the repo. if this affects you, congratulations. i will fix it. the bug bounty for the fix is $100 per package.
-        ctx.packages.sort((a, b) => pwdIndexMap[a.path] - pwdIndexMap[b.path] + a.name.localeCompare(b.name) / 1_000_000)
+      // sort topologically, alphabetically as a tiebreaker. note that this implementation relies on there being fewer than one million packages in the repo. if this affects you, congratulations. i will fix it. the bug bounty for the fix is $100 per package.
+      ctx.packages.sort((a, b) => pwdIndexMap[a.path] - pwdIndexMap[b.path] + a.name.localeCompare(b.name) / 1_000_000)
 
-        ctx.packages.forEach((pkg, i, {length}) => {
-          const number = Number(`1${'0'.repeat(length.toString().length + 1)}`) + i
-          pkg.folder = path.join(ctx.tempDir, `${number}.${pkg.name.replace('/', '__')}`)
-        })
-        task.output = ctx.packages.map(pkg => `${pkg.name}`).join(', ')
-        return `Found ${ctx.packages.length} packages to publish`
-      },
+      ctx.packages.forEach((pkg, i, {length}) => {
+        const number = Number(`1${'0'.repeat(length.toString().length + 1)}`) + i
+        pkg.folder = path.join(ctx.tempDir, `${number}.${pkg.name.replace('/', '__')}`)
+      })
+      task.output = ctx.packages.map(pkg => `${pkg.name}`).join(', ')
+      return `Found ${ctx.packages.length} packages to publish`
     },
-    {
-      title: 'Apply package config',
-      rendererOptions: {persistentOutput: true},
-      task: async (ctx, task) => {
-        applyPublishNames(ctx.packages, config, {scope: options.scope})
-        const renamed = ctx.packages
-          .filter(pkg => pkg.name !== pkg.publishName)
-          .map(pkg => `${pkg.name} -> ${pkg.publishName}`)
-        task.output = renamed.length ? renamed.join(', ') : 'No package renames'
-      },
+  },
+  {
+    title: 'Getting published versions',
+    task: (ctx, task) => {
+      return task.newListr(
+        ctx.packages.map(pkg => ({
+          title: `Getting published versions for ${pkg.name}`,
+          task: async _ctx => {
+            fs.mkdirSync(path.join(pkg.folder, LHS_FOLDER), {recursive: true})
+            pkg.publishedVersions = await getRegistryVersions(pkg)
+          },
+        })),
+        {concurrent: true},
+      )
     },
-    {
-      title: 'Getting published versions',
-      task: (ctx, task) => {
-        return task.newListr(
-          ctx.packages.map(pkg => ({
-            title: `Getting published versions for ${pkg.publishName}`,
-            task: async _ctx => {
-              fs.mkdirSync(path.join(pkg.folder, LHS_FOLDER), {recursive: true})
-              pkg.publishedVersions = await getRegistryVersions(pkg)
-            },
-          })),
-          {concurrent: true},
-        )
-      },
-    },
-  ]
+  },
+]
 
-  return {
-    getConfig: () => config,
-    tasks,
-  }
-}
-
-async function getRegistryVersions(pkg: Pick<Pkg, 'publishName'>) {
-  const registryVersionsResult = await execa('npm', ['view', pkg.publishName, 'versions', '--json'], {reject: false})
+async function getRegistryVersions(pkg: Pick<Pkg, 'name'>) {
+  const registryVersionsResult = await execa('npm', ['view', pkg.name, 'versions', '--json'], {reject: false})
   const StdoutShape = z.union([
     z.array(z.string()).nonempty(), // success
     z.object({error: z.object({code: z.literal('E404')})}), // not found - package doesn't exist (yet!). this is ok. other errors are not.
@@ -197,12 +165,12 @@ const _breakpoint = (why = 'hmm'): ListrTask<Ctx> => ({
   },
 })
 
-export const publish = async (input: PublishOptions) => {
+export const publish = async (input: PublishInput) => {
   const {sortPackageJson} = await import('sort-package-json')
-  const setup = createSetupContext({scope: input.scope, config: input.config})
+  const config = await loadMopubConfig(getWorkspaceRoot())
   const tasks = new Listr(
     [
-      ...setup.tasks,
+      ...setupContextTasks,
       {
         title: `Writing local packages`,
         task: (ctx, task) => {
@@ -303,7 +271,7 @@ export const publish = async (input: PublishOptions) => {
         task: (ctx, task) => {
           return task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Pulling ${pkg.publishName}`,
+              title: `Pulling ${pkg.name}`,
               rendererOptions: {persistentOutput: true},
               task: async (_ctx, subtask) => {
                 const registryVersions = pkg.publishedVersions
@@ -322,14 +290,14 @@ export const publish = async (input: PublishOptions) => {
                 }
 
                 // note: `npm pack foobar` will actually pull foobar.1-2-3.tgz from the registry. It's not actually doing a "pack" at all. `pnpm pack` does not do the same thing - it packs the local directory
-                await pipeExeca(subtask, 'npm', ['pack', `${pkg.publishName}@${publishedVersionForComparison}`], {
+                await pipeExeca(subtask, 'npm', ['pack', `${pkg.name}@${publishedVersionForComparison}`], {
                   reject: false,
                   cwd: publishedAlreadyFolder,
                 })
 
                 const tgzFileName = fs.readdirSync(publishedAlreadyFolder).at(0)
                 if (!tgzFileName) {
-                  const msg = `No tgz file found in ${publishedAlreadyFolder}, even though a last release was found for ${pkg.publishName}. Registry versions: ${registryVersions.join(', ')}`
+                  const msg = `No tgz file found in ${publishedAlreadyFolder}, even though a last release was found. Registry versions: ${registryVersions.join(', ')}`
                   throw new Error(msg)
                 }
 
@@ -385,7 +353,7 @@ export const publish = async (input: PublishOptions) => {
 
             let newVersion = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
               type: 'Select',
-              message: `Select semver increment for ${getPackageDisplayName(pkg)} or specify new version (current latest is ${currentVersion})`,
+              message: `Select semver increment for ${pkg.name} or specify new version (current latest is ${currentVersion})`,
               choices,
             })
             if (newVersion === 'none') {
@@ -452,7 +420,7 @@ export const publish = async (input: PublishOptions) => {
         task: (ctx, task) => {
           return task.newListr<Ctx>(
             ctx.packages.map(pkg => ({
-              title: `Modify ${getPackageDisplayName(pkg)}`,
+              title: `Modify ${pkg.name}`,
               task: async (_ctx, _subtask) => {
                 if (!pkg.targetVersion || !semver.valid(pkg.targetVersion)) {
                   throw new Error(`Invalid version for ${pkg.name}: ${pkg.targetVersion}`)
@@ -469,7 +437,10 @@ export const publish = async (input: PublishOptions) => {
                   sha: sha.stdout,
                 }
 
-                packageJson.name = pkg.publishName
+                if (input.scope) {
+                  const name = packageJson.name.split('/').at(-1)
+                  packageJson.name = `${input.scope}/${name}`
+                }
 
                 const bumped = await getBumpedDependencies(ctx, {pkg})
                 packageJson.dependencies = bumped.dependencies
@@ -487,18 +458,18 @@ export const publish = async (input: PublishOptions) => {
       },
       {
         title: 'Transform packages',
-        task: async (ctx, task) => {
-          return task.newListr<Ctx>(
+        enabled: () => Boolean(config.transformPackage),
+        task: (ctx, task) =>
+          task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Transform ${pkg.publishName}`,
+              title: `Transform ${pkg.name}`,
               task: async () => {
                 if (!pkg.targetVersion) throw new Error(`No target version for ${pkg.name}`)
-                await runTransformPackage(setup.getConfig(), {
+                await runTransformPackage(config, {
+                  directory: path.dirname(packageJsonFilepath(pkg, RHS_FOLDER)),
                   packageDir: path.dirname(packageJsonFilepath(pkg, RHS_FOLDER)),
-                  packageJsonPath: packageJsonFilepath(pkg, RHS_FOLDER),
                   pkg: {
                     name: pkg.name,
-                    publishName: pkg.publishName,
                     version: pkg.version,
                     targetVersion: pkg.targetVersion,
                     path: pkg.path,
@@ -507,15 +478,14 @@ export const publish = async (input: PublishOptions) => {
               },
             })),
             {concurrent: false},
-          )
-        },
+          ),
       },
       {
         title: 'Write changelogs',
         task: async (ctx, task) => {
           return task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Write ${pkg.publishName} changelog`,
+              title: `Write ${pkg.name} changelog`,
               task: async () => getOrCreateChangelog(ctx, pkg),
             })),
             {concurrent: true},
@@ -527,7 +497,7 @@ export const publish = async (input: PublishOptions) => {
         task: (ctx, task) =>
           task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Diff ${pkg.publishName}`,
+              title: `Diff ${pkg.name}`,
               task: async (_ctx, subtask) => {
                 const leftFolderPath = path.dirname(packageJsonFilepath(pkg, LHS_FOLDER))
                 const rightFolderPath = path.dirname(packageJsonFilepath(pkg, RHS_FOLDER))
@@ -554,7 +524,7 @@ export const publish = async (input: PublishOptions) => {
                 const rightRef = rightPackageJson?.git?.sha
 
                 if (!rightRef) {
-                  throw new Error(`No ref found for package.json preparing to be plubished for ${pkg.publishName}`)
+                  throw new Error(`No ref found for package.json preparing to be plubished for ${pkg.name}`)
                 }
 
                 if (leftRef && rightRef) {
@@ -575,7 +545,7 @@ export const publish = async (input: PublishOptions) => {
         task: async (ctx, task) => {
           return task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Write ${pkg.publishName} changelog`,
+              title: `Write ${pkg.name} changelog`,
               task: async () => getOrCreateChangelog(ctx, pkg),
             })),
             {concurrent: true},
@@ -632,31 +602,11 @@ function loadContext(folderPath: string) {
   if (!fs.existsSync(contextFilepath)) throw new Error(`No context found at ${contextFilepath}`)
   const ctxString = fs.readFileSync(contextFilepath).toString()
   try {
-    const json = normalizeLoadedContext(JSON.parse(ctxString))
+    const json = JSON.parse(ctxString) as {}
     return Ctx.parse(json)
   } catch (e) {
     throw new Error(`Invalid context at ${contextFilepath}: ${String(e)}`)
   }
-}
-
-function normalizeLoadedContext(json: unknown) {
-  if (!isObjectWithPackages(json)) return json
-  return {
-    ...json,
-    packages: json.packages.map(pkg =>
-      isObjectWithName(pkg) && !('publishName' in pkg)
-        ? {...pkg, publishName: pkg.name}
-        : pkg,
-    ),
-  }
-}
-
-function isObjectWithPackages(value: unknown): value is {packages: unknown[]} {
-  return Boolean(value && typeof value === 'object' && 'packages' in value && Array.isArray(value.packages))
-}
-
-function isObjectWithName(value: unknown): value is {name: string} {
-  return Boolean(value && typeof value === 'object' && 'name' in value && typeof value.name === 'string')
 }
 
 export const PrebuiltInput = z.tuple([
@@ -718,7 +668,7 @@ function createPublishTasks(ctx: Ctx, options: {otp?: string; tag?: string}) {
       const rhsPackageJson = loadRHSPackageJson(pkg)
       ensureValidBumpedVersion(lhsPackageJson?.version || VERSION_ZERO, rhsPackageJson?.version)
       return {
-        title: `Publish ${pkg.publishName} ${lhsPackageJson?.version || '✨NEW!✨'} -> ${rhsPackageJson?.version}`,
+        title: `Publish ${pkg.name} ${lhsPackageJson?.version || '✨NEW!✨'} -> ${rhsPackageJson?.version}`,
         task: async (_ctx, subtask) => {
           const publishArgs = ['--access', 'public']
           if (options.otp) publishArgs.push('--otp', options.otp)
@@ -733,7 +683,7 @@ function createPublishTasks(ctx: Ctx, options: {otp?: string; tag?: string}) {
               Boolean(semver.prerelease(lhsPackageJson.version)) ===
               Boolean(semver.prerelease(rhsPackageJson.version))
             if (sameType) {
-              const distTags = await getRegistryDistTags(pkg.publishName)
+              const distTags = await getRegistryDistTags(pkg.name)
               const matchingTags = Object.entries(distTags)
                 .filter(([, v]) => v === lhsPackageJson.version)
                 .map(([t]) => t)
@@ -805,11 +755,11 @@ export type ReleaseNotesInput = z.infer<typeof ReleaseNotesInput>
 
 async function pullRegistryPackage(
   subtask: ListrTaskWrapper<Ctx, never, never>,
-  pkg: {publishName: string},
+  pkg: {name: string},
   {version, folder}: {version: string; folder: string},
 ) {
   // note: `npm pack foobar` will actually pull foobar.1-2-3.tgz from the registry. It's not actually doing a "pack" at all. `pnpm pack` does not do the same thing - it packs the local directory
-  const packResult = await pipeExeca(subtask, 'npm', ['pack', `${pkg.publishName}@${version}`], {cwd: folder})
+  const packResult = await pipeExeca(subtask, 'npm', ['pack', `${pkg.name}@${version}`], {cwd: folder})
 
   const packStdout = typeof packResult.stdout === 'string' ? packResult.stdout : ''
   const tgzFileName = packStdout
@@ -820,7 +770,7 @@ async function pullRegistryPackage(
   if (!tgzFileName || !folderEntries.includes(tgzFileName)) {
     throw new Error(
       [
-        `Expected npm pack ${pkg.publishName}@${version} to write ${tgzFileName || 'a .tgz file'} in ${folder}.`,
+        `Expected npm pack ${pkg.name}@${version} to write ${tgzFileName || 'a .tgz file'} in ${folder}.`,
         `Found: ${folderEntries.length ? folderEntries.join(', ') : '(nothing)'}`,
       ].join('\n'),
     )
@@ -913,10 +863,6 @@ async function getPackageLastPublishRef(pkg: Pkg, task: ListrTaskWrapper<Ctx, ne
 
 const first7 = (s: string) => s.slice(0, 7)
 
-function getPackageDisplayName(pkg: Pick<Pkg, 'name' | 'publishName'>) {
-  return pkg.name === pkg.publishName ? pkg.name : `${pkg.name} -> ${pkg.publishName}`
-}
-
 async function getPackageJsonGitSha(
   pkg: Pkg,
   packageJson: PackageJson | null,
@@ -970,7 +916,7 @@ async function getPackageJsonGitSha(
 
   const selected = await task.prompt(ListrEnquirerPromptAdapter).run<string>({
     type: 'Select',
-    message: `Couldn't find a git sha for the last published version of ${pkg.publishName}.${recentList}\nSelect the sha to diff from:`,
+    message: `Couldn't find a git sha for the last published version of ${pkg.name}.${recentList}\nSelect the sha to diff from:`,
     choices,
   })
   if (selected !== 'other') return selected
@@ -995,7 +941,7 @@ async function getPackageJsonGitSha(
 async function findLastPublishWithFindableSha(pkg: Pkg, recentCommitLines: string[]) {
   const newestFirst = pkg.publishedVersions.toReversed().slice(0, 20)
   for (const version of newestFirst) {
-    const {stdout: registrySha} = await execa('npm', ['view', `${pkg.publishName}@${version}`, 'git.sha'], {reject: false})
+    const {stdout: registrySha} = await execa('npm', ['view', `${pkg.name}@${version}`, 'git.sha'], {reject: false})
     if (registrySha.trim()) return {version, sha: registrySha.trim()}
 
     const tagSha = await getShaFromVersionTag(pkg, version)
@@ -1012,7 +958,7 @@ async function findLastPublishWithFindableSha(pkg: Pkg, recentCommitLines: strin
 async function getLastCommitBeforePreviousPublish(pkg: Pkg, packageJson: PackageJson | null) {
   const previousVersion = packageJson?.version || pkg.publishedVersions.at(-1)
   if (!previousVersion) return null
-  const timesResult = await execa('npm', ['view', pkg.publishName, 'time', '--json'], {reject: false})
+  const timesResult = await execa('npm', ['view', pkg.name, 'time', '--json'], {reject: false})
   const times = z.record(z.string(), z.string()).safeParse(JSON.parse(timesResult.stdout || '{}'))
   const publishTime = times.success ? times.data[previousVersion] : undefined
   if (!publishTime) return null
@@ -1087,30 +1033,22 @@ async function getBumpedDependencies(ctx: Ctx, params: {pkg: Pkg}) {
     }
 
     const section: DepSection =
-      DEP_SECTIONS.find(s => rightPackageJson?.[s]?.[depName] || rightPackageJson?.[s]?.[foundDep.publishName]) ||
-      DEP_SECTIONS.find(s => leftPackageJson?.[s]?.[depName] || leftPackageJson?.[s]?.[foundDep.publishName]) ||
+      DEP_SECTIONS.find(s => rightPackageJson?.[s]?.[depName]) ||
+      DEP_SECTIONS.find(s => leftPackageJson?.[s]?.[depName]) ||
       'dependencies'
-    const currentVersionInSection = rightPackageJson?.[section]?.[depName] || rightPackageJson?.[section]?.[foundDep.publishName]
+    const currentVersionInSection = rightPackageJson?.[section]?.[depName]
     let prefix = ['^', '~', ''].find(p => currentVersionInSection?.startsWith(p)) || ''
     if (semver.prerelease(expected)) {
       prefix = ''
     }
     const newVersion = prefix + expected
 
-    writePublishedDependencyVersion(bumped, {
-      section,
-      sourceName: depName,
-      publishName: foundDep.publishName,
-      version: newVersion,
-    })
+    bumped[section] = {...bumped[section], [depName]: newVersion}
 
     const leftVersion =
       leftPackageJson?.dependencies?.[depName] ||
       leftPackageJson?.peerDependencies?.[depName] ||
-      leftPackageJson?.optionalDependencies?.[depName] ||
-      leftPackageJson?.dependencies?.[foundDep.publishName] ||
-      leftPackageJson?.peerDependencies?.[foundDep.publishName] ||
-      leftPackageJson?.optionalDependencies?.[foundDep.publishName]
+      leftPackageJson?.optionalDependencies?.[depName]
     updates[depName] = `${leftVersion || '(new)'} -> ${newVersion}`
   }
 
@@ -1167,7 +1105,7 @@ async function getPackageRevList(pkg: Pkg) {
     // versionComparisonString,
     markdown:
       sections.filter(Boolean).join('\n').trim() ||
-      `No commits to ${pkg.publishName} between found between ${fromRef.slice(0, 7)} (last publish) and ${localRef.slice(0, 7)} (current).`,
+      `No commits to ${pkg.name} between found between ${fromRef.slice(0, 7)} (last publish) and ${localRef.slice(0, 7)} (current).`,
   }
 }
 
@@ -1205,7 +1143,7 @@ async function getChangelog(ctx: Ctx, pkg: Pkg) {
   const sourceChanges = await getPackageRevList(pkg)
   const npmVersionLink = (packageJson: PackageJson | null | undefined) => {
     const version = packageJson?.version
-    return `[${version || 'unknown'}](https://npmjs.com/package/${pkg.publishName}${version ? `/v/${version}` : ''})`
+    return `[${version || 'unknown'}](https://npmjs.com/package/${pkg.name}${version ? `/v/${version}` : ''})`
   }
   const repoUrl = getPackageJsonRepository(
     loadRHSPackageJson(pkg) ||
@@ -1218,8 +1156,7 @@ async function getChangelog(ctx: Ctx, pkg: Pkg) {
     changes.push(
       [
         `<!-- data-change-type="source" data-pkg="${pkg.name}" -->`, // break
-        `<!-- data-publish-name="${pkg.publishName}" -->`,
-        `# ${pkg.publishName}`,
+        `# ${pkg.name}`,
         '',
         '|old version|new version|compare|',
         '|-|-|-|',
@@ -1241,7 +1178,7 @@ async function getChangelog(ctx: Ctx, pkg: Pkg) {
       const newMessage = [
         '<!-- data-change-type="dependencies" -->',
         `<details>`,
-        `<summary>Dependency ${depPkg.publishName} ${verb} (${bumpedDeps.updated[dep]})</summary>`,
+        `<summary>Dependency ${depPkg.name} ${verb} (${bumpedDeps.updated[dep]})</summary>`,
         '',
         '<blockquote>',
         depChanges
@@ -1347,7 +1284,6 @@ const PkgMeta = z.object({
 
 const Pkg = PkgMeta.extend({
   name: z.string(),
-  publishName: z.string(),
   version: z.string(),
   path: z.string(),
   private: z.boolean(),
@@ -1408,17 +1344,16 @@ function findUpOrThrow(file: string, options?: Parameters<typeof findUpSync>[1])
 }
 
 export async function releaseNotes(input: ReleaseNotesInput) {
-  const setup = createSetupContext({scope: input.scope})
   const tasks = new Listr<Ctx, never, never>(
     [
-      ...setup.tasks,
+      ...setupContextTasks,
       {
         title: `Get comparison`,
         enabled: () => !input.comparison,
         task: async (ctx, task) => {
           const pkgVersions = await Promise.all(
             ctx.packages.map(async pkg => ({
-              name: pkg.publishName,
+              name: pkg.name,
               versions: await getRegistryVersions(pkg),
             })),
           )
@@ -1449,7 +1384,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
         task: async (ctx, task) => {
           return task.newListr<Ctx>(
             ctx.packages.map(pkg => ({
-              title: `Write ${pkg.publishName} locally`,
+              title: `Write ${pkg.name} locally`,
               task: async (_ctx, subtask) => {
                 if (!input.comparison) throw new Error('No comparison provided')
                 const pullables = [
@@ -1460,11 +1395,21 @@ export async function releaseNotes(input: ReleaseNotesInput) {
                   fs.mkdirSync(pullable.folder, {recursive: true})
                   if (semver.valid(pullable.str)) {
                     if (pullable.side === 'right') pkg.targetVersion = pullable.str
-                    subtask.output = `Pulling ${pullable.str} for ${pkg.publishName}`
+                    subtask.output = `Pulling ${pullable.str} for ${pkg.name}`
                     const packageJson = await pullRegistryPackage(subtask, pkg, {
                       version: pullable.str,
                       folder: pullable.folder,
                     })
+                      .catch(e => {
+                        if (`${e}`.includes('No matching version found') && input.scope) {
+                          const scopedPkg = {...pkg, name: `${input.scope}/${pkg.name}`}
+                          return pullRegistryPackage(subtask, scopedPkg, {
+                            version: pullable.str,
+                            folder: pullable.folder,
+                          })
+                        }
+                        throw e
+                      })
                       .catch(async e => {
                         if (`${e}`.includes('No matching version found')) {
                           // if the version doesn't exist on the registry, we might have passed a comparison string from before it existed (can happen with fixed versioning)
@@ -1484,7 +1429,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
                     pkg.shas[pullable.side] = pullable.str
                     const versions = await getRegistryVersions(pkg)
                     for (const version of versions.toReversed()) {
-                      subtask.output = `Pulling ${version} for ${pkg.publishName}`
+                      subtask.output = `Pulling ${version} for ${pkg.name}`
                       const packedPackageJson = await pullRegistryPackage(subtask, pkg, {
                         version,
                         folder: pullable.folder,
@@ -1495,7 +1440,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
                       }
                     }
                   } else {
-                    throw new Error(`Unknown release ${pullable.str} for ${pkg.publishName}`)
+                    throw new Error(`Unknown release ${pullable.str} for ${pkg.name}`)
                   }
                 }
               },
@@ -1509,7 +1454,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
         task: async (ctx, task) => {
           return task.newListr(
             ctx.packages.map(pkg => ({
-              title: `Write ${pkg.publishName} changelog`,
+              title: `Write ${pkg.name} changelog`,
               task: async () => getOrCreateChangelog(ctx, pkg),
             })),
             {concurrent: true},
@@ -1560,8 +1505,8 @@ export async function releaseNotes(input: ReleaseNotesInput) {
           } else {
             for (const pkg of ctx.packages) {
               const body = await getOrCreateChangelog(ctx, pkg)
-              const title = `${pkg.publishName}@v${pkg.targetVersion}`
-              const tag = `${pkg.publishName}@v${pkg.targetVersion}` // same as title... today
+              const title = `${pkg.name}@v${pkg.targetVersion}`
+              const tag = `${pkg.name}@v${pkg.targetVersion}` // same as title... today
               const message = `👇👇👇${title} changelog👇👇👇\n\n${body}\n\n👆👆👆${title} changelog👆👆👆`
               const doRelease = await task.prompt(ListrEnquirerPromptAdapter).run<boolean>({
                 type: 'confirm',

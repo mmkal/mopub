@@ -5,7 +5,6 @@ import * as trpcServer from '@trpc/server'
 import * as trpcCli from 'trpc-cli'
 import {z} from 'zod'
 import {releaseNotes, ReleaseNotesInput, publish, PublishInput, PrebuiltInput, publishPrebuilt, Ctx} from './publish.js'
-import {findPackageByPublishedDependencyName} from './package-identity.js'
 
 const t = trpcServer.initTRPC.meta<trpcCli.TrpcCliMeta>().create()
 
@@ -68,15 +67,15 @@ const router = t.router({
         packageJson.description = [warning, packageJson.description].filter(Boolean).join('\n\n')
 
         for (const dep of Object.keys(packageJson.dependencies || {})) {
-          const foundDep = findPackageByPublishedDependencyName(ctx.packages, dep)
+          const foundDep = ctx.packages.find(p => p.name === dep)
           if (foundDep) {
             packageJson.dependencies![dep] = `file:${path.join(foundDep.folder, 'right/package')}`
           }
         }
         for (const peerDep of Object.keys(packageJson.peerDependencies || {})) {
-          const foundPeerDep = findPackageByPublishedDependencyName(ctx.packages, peerDep)
+          const foundPeerDep = ctx.packages.find(p => p.name === peerDep)
           if (foundPeerDep) {
-            packageJson.peerDependencies![peerDep] = dateVersion
+            packageJson.peerDependencies![foundPeerDep.name] = dateVersion
           }
         }
         fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2))
