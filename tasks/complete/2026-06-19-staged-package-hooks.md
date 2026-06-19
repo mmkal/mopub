@@ -1,13 +1,13 @@
 ---
-status: ready
+status: complete
 size: medium
 ---
 
 # Staged package transforms
 
-Status summary: Spec is locked after a grill-you pass. Main decision: add a narrow staged-package transform and declarative publish identity mapping, not a broad hook/plugin system. Nothing is implemented yet.
+Status summary: Complete on the `staged-package-hooks` branch. Implemented root config discovery, declarative `publishName`, staged package transforms, helper APIs, identity-aware publish/release/local flows, docs, and focused tests. Missing only PR review/merge.
 
-Decision trail: [staged-package-hooks.interview.md](staged-package-hooks.interview.md)
+Decision trail: [2026-06-19-staged-package-hooks.interview.md](2026-06-19-staged-package-hooks.interview.md)
 
 ## Goal
 
@@ -126,20 +126,20 @@ Command coverage:
 
 ## Checklist
 
-- [ ] Add config types, `defineConfig`, public module entrypoint, package `exports`/`types`, and declaration output.
-- [ ] Add config discovery/loading/validation for `mopub.config.mjs`, `.js`, and `.cjs`.
-- [ ] Resolve and persist `publishName`, including `--scope` compatibility and unknown package-key validation.
-- [ ] Use `publishName` for all npm registry lookups/pulls, dist-tag lookup, npm links, publish labels, and user-facing changelog/release text.
-- [ ] Keep source `name` for workspace dependency matching, source git history, and temp folder naming.
-- [ ] Rewrite staged workspace dependency keys to dependency `publishName` where needed.
-- [ ] Add path-confined async transform helpers.
-- [ ] Run top-level `transformPackage` sequentially after built-in package metadata writes and before changelog/diff/context/publish.
-- [ ] Implement package.json writeback conflict detection and final name/version validation.
-- [ ] Make `releaseNotes` use identity mapping without running transforms.
-- [ ] Make `local --prebuilt` match dependency keys by `publishName` first, source `name` second.
-- [ ] Document the config API and forked-package example in `README.md`.
-- [ ] Add focused `node:test`/`tsx` tests for config validation, helper confinement, identity resolution, dependency key rewriting, and package.json writeback where practical.
-- [ ] Run `pnpm test`, `pnpm build`, and `pnpm lint`.
+- [x] Add config types, `defineConfig`, public module entrypoint, package `exports`/`types`, and declaration output. _Implemented in `src/config.ts`, `src/index.ts`, `package.json`, and `tsconfig.json`._
+- [x] Add config discovery/loading/validation for `mopub.config.mjs`, `.js`, and `.cjs`. _Implemented by `loadMopubConfig` with strict zod validation._
+- [x] Resolve and persist `publishName`, including `--scope` compatibility and unknown package-key validation. _Implemented in `src/package-identity.ts` and setup context._
+- [x] Use `publishName` for all npm registry lookups/pulls, dist-tag lookup, npm links, publish labels, and user-facing changelog/release text. _Updated registry, publish, changelog, and release-note paths in `src/publish.ts`._
+- [x] Keep source `name` for workspace dependency matching, source git history, and temp folder naming. _Source identity remains the graph/path key; `publishName` is separate._
+- [x] Rewrite staged workspace dependency keys to dependency `publishName` where needed. _Implemented via `writePublishedDependencyVersion` inside `getBumpedDependencies`._
+- [x] Add path-confined async transform helpers. _Implemented in `src/transform-package.ts`._
+- [x] Run top-level `transformPackage` sequentially after built-in package metadata writes and before changelog/diff/context/publish. _Added `Transform packages` task after `Modify local packages`._
+- [x] Implement package.json writeback conflict detection and final name/version validation. _Implemented in `runTransformPackage`._
+- [x] Make `releaseNotes` use identity mapping without running transforms. _Release notes use setup identity config; transforms remain publish-only._
+- [x] Make `local --prebuilt` match dependency keys by `publishName` first, source `name` second. _Implemented in `src/cli.ts`._
+- [x] Document the config API and forked-package example in `README.md`. _Added staged package transforms section._
+- [x] Add focused `node:test`/`tsx` tests for config validation, helper confinement, identity resolution, dependency key rewriting, and package.json writeback where practical. _Added tests under `test/`._
+- [x] Run `pnpm test`, `pnpm build`, and `pnpm lint`. _All passed; lint exits successfully with warnings from the existing formatting/import-order setup._
 
 ## Non-goals
 
@@ -171,3 +171,4 @@ Command coverage:
 
 - Grill workspace: `/tmp/grillings/mopub/staged-package-hooks/`
 - jsonata reference repo inspected: `/Users/mmkal/src/jsonata`, branch `sync-package`.
+- Verification: `pnpm test`, `pnpm build`, `pnpm lint`, and `node -e "import('mopub').then(m => console.log(typeof m.defineConfig))"`.
