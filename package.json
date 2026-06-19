@@ -7,6 +7,13 @@
     "type": "git",
     "url": "https://github.com/mmkal/mopub"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
   "bin": {
     "mopub": "dist/cli.js"
   },
