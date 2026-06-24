@@ -42,6 +42,10 @@ const router = t.router({
             'path to prebuilt folder. if ommitted a dry-run publish will be done to build and pack packages into a temp folder.\nNOTE: if you provide this value, dependencies in this folder will be replaced with local versions using the file protocol.',
           )
           .optional(),
+        config: z
+          .string()
+          .describe('path to a config module to import when building the local staging package.')
+          .optional(),
       }),
     )
     .mutation(async ({input: options}) => {
@@ -54,6 +58,7 @@ const router = t.router({
             version: dateVersion,
             publish: false,
             skipRegistryPull: true,
+            config: options.config,
           })
 
       for (const pkg of ctx.packages) {

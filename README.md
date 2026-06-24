@@ -27,6 +27,32 @@ Other commands:
 - `npx mopub local` replaces workspace deps with `file:` paths and prints `pnpm add` commands so you can test installs in another project.
 - `npx mopub --help` for the full option list.
 
+## Transform staged packages
+
+Pass a config module with `--config` when the staged package needs final edits before publish:
+
+```
+npx mopub --config ./publish.ignoreme.mjs
+```
+
+```js
+import {defineConfig} from 'mopub'
+
+export default defineConfig({
+  async transformPackage({directory, helpers}) {
+    await helpers.editJsonFile('package.json', packageJson => {
+      packageJson.name = '@mmkal/jsonata'
+    })
+
+    await helpers.editFile('README.md', readme => {
+      return `This is a fork of jsonata.\n\n${readme.replaceAll(/\bjsonata\b/g, '@mmkal/jsonata')}`
+    })
+  },
+})
+```
+
+The transform runs after mopub writes version/git/dependency metadata into `right/package`, and before changelogs, diffs, context, and publishing. mopub does not look for a default config filename; it only imports the module passed to `--config`. For simple scope changes, `--scope @your-scope` is still the better option.
+
 ## Caveats
 
 - pnpm only. It shells out to `pnpm list` and `pnpm recursive exec`, and looks for a `pnpm-workspace.yaml` or `pnpm-lock.yaml` at the workspace root.

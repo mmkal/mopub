@@ -6,6 +6,8 @@ import {Listr, ListrTask, ListrTaskWrapper} from 'listr2'
 import * as path from 'path'
 import * as semver from 'semver'
 import {z} from 'zod'
+import {loadMopubConfig} from './config.js'
+import {runTransformPackage} from './transform-package.js'
 
 const VERSION_ZERO = '0.0.0'
 
@@ -45,6 +47,10 @@ export const PublishInput = z
       .string()
       .regex(/^@[\w-_.]+$/)
       .describe('change the scope of the package before publishing')
+      .optional(),
+    config: z
+      .string()
+      .describe('path to a config module to import. If omitted, no config module is loaded.')
       .optional(),
   })
   .refine(obj => !(obj.bump && obj.version), {message: `Don't use --bump and --version together`})
@@ -165,6 +171,7 @@ const _breakpoint = (why = 'hmm'): ListrTask<Ctx> => ({
 
 export const publish = async (input: PublishInput) => {
   const {sortPackageJson} = await import('sort-package-json')
+  const config = await loadMopubConfig(input.config)
   const tasks = new Listr(
     [
       ...setupContextTasks,
@@ -274,8 +281,7 @@ export const publish = async (input: PublishInput) => {
                 const registryVersions = pkg.publishedVersions
                 const publishedAlreadyFolder = path.join(pkg.folder, LHS_FOLDER)
                 const publishedVersionForComparison = registryVersions
-                  .slice()
-                  .reverse()
+                  .toReversed()
                   .find(
                     v =>
                       ctx.versionStrategy.type === 'independent' || // independent mode: compare to prerelease versions
@@ -453,6 +459,30 @@ export const publish = async (input: PublishInput) => {
             })),
           )
         },
+      },
+      {
+        title: 'Transform packages',
+        enabled: () => Boolean(config.transformPackage),
+        task: (ctx, task) =>
+          task.newListr(
+            ctx.packages.map(pkg => ({
+              title: `Transform ${pkg.name}`,
+              task: async () => {
+                if (!pkg.targetVersion) throw new Error(`No target version for ${pkg.name}`)
+                await runTransformPackage(config, {
+                  directory: path.dirname(packageJsonFilepath(pkg, RHS_FOLDER)),
+                  packageDir: path.dirname(packageJsonFilepath(pkg, RHS_FOLDER)),
+                  pkg: {
+                    name: pkg.name,
+                    version: pkg.version,
+                    targetVersion: pkg.targetVersion,
+                    path: pkg.path,
+                  },
+                })
+              },
+            })),
+            {concurrent: false},
+          ),
       },
       {
         title: 'Write changelogs',
@@ -913,7 +943,7 @@ async function getPackageJsonGitSha(
  * `npm view` calls.
  */
 async function findLastPublishWithFindableSha(pkg: Pkg, recentCommitLines: string[]) {
-  const newestFirst = pkg.publishedVersions.slice().reverse().slice(0, 20)
+  const newestFirst = pkg.publishedVersions.toReversed().slice(0, 20)
   for (const version of newestFirst) {
     const {stdout: registrySha} = await execa('npm', ['view', `${pkg.name}@${version}`, 'git.sha'], {reject: false})
     if (registrySha.trim()) return {version, sha: registrySha.trim()}
@@ -1144,7 +1174,7 @@ async function getChangelog(ctx: Ctx, pkg: Pkg) {
   const bumpedDeps = await getBumpedDependencies(ctx, {pkg})
 
   // reverse order of pkg dependencies so the most interesting ones go first
-  for (const depPkg of workspaceDependencies(pkg, ctx).slice().reverse()) {
+  for (const depPkg of workspaceDependencies(pkg, ctx).toReversed()) {
     const dep = depPkg.name
     if (bumpedDeps.updated[dep]) {
       const depChanges = await getChangelog(ctx, depPkg)
@@ -1341,7 +1371,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
           const left =
             all
               .slice(0, -1)
-              .reverse()
+              .toReversed()
               .find(v => {
                 if (v === latest) return false
                 if (semver.prerelease(latest)) return true // if RHS is prerelease, then we whichever version was immediately before it
@@ -1402,7 +1432,7 @@ export async function releaseNotes(input: ReleaseNotesInput) {
                     pkg.shas ||= {} as never
                     pkg.shas[pullable.side] = pullable.str
                     const versions = await getRegistryVersions(pkg)
-                    for (const version of versions.slice().reverse()) {
+                    for (const version of versions.toReversed()) {
                       subtask.output = `Pulling ${version} for ${pkg.name}`
                       const packedPackageJson = await pullRegistryPackage(subtask, pkg, {
                         version,
