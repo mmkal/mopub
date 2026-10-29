@@ -13,13 +13,17 @@ void test('bumps a workspace peer dependency that is also a dev dependency', asy
     b: {peerDependencies: {a: 'workspace:*'}, devDependencies: {a: 'workspace:*'}},
   })
 
-  const result = await execa(path.resolve('node_modules/.bin/tsx'), [path.resolve('src/cli.ts'), '--version', '1.0.0'], {
-    cwd: fixture.repoPath,
-    env: {PATH: `${fixture.binPath}:${process.env.PATH}`},
-    stdin: 'ignore',
-    all: true,
-    reject: false,
-  })
+  const result = await execa(
+    path.resolve('node_modules/.bin/tsx'),
+    [path.resolve('src/cli.ts'), '--version', '1.0.0'],
+    {
+      cwd: fixture.repoPath,
+      env: {PATH: `${fixture.binPath}:${process.env.PATH}`},
+      stdin: 'ignore',
+      all: true,
+      reject: false,
+    },
+  )
   const stagingFolder = result.stdout.match(/npx mopub prebuilt (\S+)/)?.[1]
   assert.ok(stagingFolder, result.all)
 
@@ -51,22 +55,22 @@ function createFixture(packages: Record<string, {peerDependencies?: {}; devDepen
   })
   const publishedSha = execaSync('git', ['rev-parse', '--short', 'HEAD'], {cwd: repoPath}).stdout
 
-  fs.writeFileSync(
+  writeExecutable(
     path.join(binPath, 'npm'),
-    `#!/usr/bin/env node
-const {execFileSync} = require('node:child_process')
-const fs = require('node:fs')
-const [command, spec, field] = process.argv.slice(2)
-if (command === 'view' && field === 'versions') console.log(JSON.stringify(['0.0.1']))
-if (command === 'pack') {
-  const name = spec.slice(0, spec.lastIndexOf('@'))
-  fs.mkdirSync('package')
-  fs.writeFileSync('package/package.json', JSON.stringify({name, version: '0.0.1', git: {sha: '${publishedSha}'}}))
-  execFileSync('tar', ['-czf', 'published.tgz', 'package'])
-  fs.rmSync('package', {recursive: true})
-}
-`,
-    {mode: 0o755},
+    `
+      #!/usr/bin/env node
+      const {execFileSync} = require('node:child_process')
+      const fs = require('node:fs')
+      const [command, spec, field] = process.argv.slice(2)
+      if (command === 'view' && field === 'versions') console.log(JSON.stringify(['0.0.1']))
+      if (command === 'pack') {
+        const name = spec.slice(0, spec.lastIndexOf('@'))
+        fs.mkdirSync('package')
+        fs.writeFileSync('package/package.json', JSON.stringify({name, version: '0.0.1', git: {sha: '${publishedSha}'}}))
+        execFileSync('tar', ['-czf', 'published.tgz', 'package'])
+        fs.rmSync('package', {recursive: true})
+      }
+    `,
   )
 
   return {
@@ -77,6 +81,10 @@ if (command === 'pack') {
       fs.rmSync(path.join('/tmp/mopub', rootName), {recursive: true, force: true})
     },
   }
+}
+
+function writeExecutable(filepath: string, content: string) {
+  fs.writeFileSync(filepath, content.replaceAll(/^ {6}/gm, '').trimStart(), {mode: 0o755})
 }
 
 function writeJson(filepath: string, value: {}) {
