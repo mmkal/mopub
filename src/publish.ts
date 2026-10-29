@@ -1007,6 +1007,21 @@ const DEP_SECTIONS = ['dependencies', 'peerDependencies', 'optionalDependencies'
 type DepSection = (typeof DEP_SECTIONS)[number]
 
 /**
+ * Names of the workspace packages a package depends on. `pkg.dependencies` comes from `pnpm list --prod`, which reports a
+ * workspace package listed in both `peerDependencies` and `devDependencies` as dev-only, so also include anything the
+ * source package.json declares with the `workspace:` protocol.
+ */
+function workspaceDependencyNames(pkg: Pkg) {
+  const sourcePackageJson = loadPackageJson(path.join(pkg.path, 'package.json'))
+  const declared = DEP_SECTIONS.flatMap(section =>
+    Object.entries(sourcePackageJson[section] || {}).flatMap(([name, spec]) =>
+      spec.startsWith('workspace:') ? [name] : [],
+    ),
+  )
+  return new Set([...Object.keys(pkg.dependencies || {}), ...declared])
+}
+
+/**
  * For a particular package, get the `dependencies` / `peerDependencies` / `optionalDependencies`
  * objects with any necessary version bumps. Each workspace dep is written back to whichever
  * section it was originally in, so peer/optional deps aren't silently promoted to regular deps.
@@ -1021,7 +1036,7 @@ async function getBumpedDependencies(ctx: Ctx, params: {pkg: Pkg}) {
   }
   const updates: Record<string, string> = {}
 
-  for (const depName of Object.keys(params.pkg.dependencies || {})) {
+  for (const depName of workspaceDependencyNames(params.pkg)) {
     const foundDep = ctx.packages.find(other => other.name === depName)
     if (!foundDep)
       throw new Error(`Package ${params.pkg.name} depends on ${depName} but ${depName} is not found in the workspace`)

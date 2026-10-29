@@ -25,7 +25,7 @@
     "build": "tsc --noEmit false --outDir dist",
     "prepack": "pnpm clean && pnpm build",
     "lint": "eslint .",
-    "test": "echo maybe later"
+    "test": "tsx --test tests/*.test.ts"
   },
   "license": "ISC",
   "packageManager": "pnpm@10.30.1",
